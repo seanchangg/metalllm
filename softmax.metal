@@ -58,9 +58,8 @@ kernel void softmaxForward(
 
 kernel void softmaxBackward(
     device const bfloat* output_cache [[buffer(0)]],
-    device const bfloat* dZ [[buffer(1)]],
-    device bfloat* dA [[buffer(2)]],
-    constant SoftMaxParams& p [[buffer(3)]],
+    device bfloat* dZ [[buffer(1)]],
+    constant SoftMaxParams& p [[buffer(2)]],
     metal::uint tid [[thread_position_in_threadgroup]],
     metal::uint gid [[threadgroup_position_in_grid]], //row idx
     metal::uint lane [[thread_index_in_simdgroup]],
@@ -89,6 +88,6 @@ kernel void softmaxBackward(
     for (metal::uint i = tid; i < p.cols; i += p.group_size) {
         float s  = float(output_cache[row_start + i]);
         float dz = float(dZ[row_start + i]);
-        dA[row_start + i] = bfloat(s * (dz - dot));
+        dZ[row_start + i] = bfloat(s * (dz - dot));
     }
 }

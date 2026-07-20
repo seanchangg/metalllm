@@ -49,8 +49,8 @@ kernel void MPPMatMulBias(
 kernel void MPPMatMulBiasBfloat(
     device bfloat* A [[buffer(0)]],
     device bfloat* B [[buffer(1)]],
-    device bfloat* bias [[buffer(2)]],
-    device float* out [[buffer(3)]],
+    device float* bias [[buffer(2)]],
+    device bfloat* out [[buffer(3)]],
     constant MatMulParams& p [[buffer(4)]],
     metal::uint tid [[thread_index_in_threadgroup]],
     metal::uint2 tgid [[threadgroup_position_in_grid]]
@@ -60,7 +60,7 @@ kernel void MPPMatMulBiasBfloat(
 
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> At(A, dextents<int32_t, 2>(p.K, p.M)); // x=K, y=M
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Bt(B, dextents<int32_t, 2>(p.N, p.K)); // x=N, y=K
-    tensor<device float, dextents<int32_t, 2>, tensor_inline> Ct(out, dextents<int32_t, 2>(p.N, p.M)); // x=N, y=M
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Ct(out, dextents<int32_t, 2>(p.N, p.M)); // x=N, y=M
 
     constexpr auto desc = matmul2d_descriptor(
         64,
@@ -82,6 +82,6 @@ kernel void MPPMatMulBiasBfloat(
     uint col_start = tgid.y * 64;
     for (uint idx = tid; idx < 64u * 64u; idx += 128u) {
         uint lr = idx / 64, lc = idx % 64;
-        out[(row_start + lr) * p.N + (col_start + lc)] += bias[col_start + lc];
+        out[(row_start + lr) * p.N + (col_start + lc)] += bfloat(bias[col_start + lc]);
     }
 }

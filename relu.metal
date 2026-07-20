@@ -1,8 +1,10 @@
 #include <metal_stdlib>
 
 /*TODO list
-    - attentionforward (fuse everything)
-    - attention backward
+    - linearBackward
+    - attentionBackward + computeGrad
+    - mlpBackward
+    - Gotta fix matmul tile sizing. Can't do multiply accumulate over the entire tensor
 */
 struct ReluInputParams {
     metal::uint count;
@@ -10,9 +12,8 @@ struct ReluInputParams {
 
 
 kernel void reluForward(
-    device const bfloat* x [[buffer(0)]],
+    device bfloat* x [[buffer(0)]],
     device uchar* mask[[buffer(1)]],
-    device bfloat* out [[buffer(2)]],
     constant ReluInputParams& p [[buffer(3)]],
     metal::uint tid [[thread_position_in_grid]]
 ) {
@@ -20,7 +21,7 @@ kernel void reluForward(
         return;
     }
     mask[tid] = (x[tid] > 0.0bf) ? 1 : 0;
-    out[tid] = x[tid] * bfloat(mask[tid]);
+    x[tid] *= bfloat(mask[tid]);
 }
 
 kernel void reluBackward(

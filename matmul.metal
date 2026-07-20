@@ -89,6 +89,7 @@ kernel void MPPMatMulBfloatBfloat(
 {
     using namespace metal;
     using namespace mpp::tensor_ops;
+    
 
     // Wrap row-major buffers as 2D tensors. Coordinate is [x, y] with x the
     // contiguous (inner) dimension: element[x,y] == ptr[y*extent0 + x].

@@ -54,10 +54,10 @@ kernel void lossForward(
 }
 
 kernel void lossBackward(
-    device const float* x_cache [[buffer(0)]],
-    device const float* lse_cache [[buffer(1)]],
-    device bfloat* dZ [[buffer(2)]],
-    device metal::uint* y [[buffer(3)]],
+    device const bfloat* x_cache [[buffer(0)]],
+    device const metal::uint* y_cache [[buffer(1)]],
+    device const float* lse_cache [[buffer(2)]],
+    device bfloat* dZ [[buffer(3)]],
     constant LossParams& p [[buffer(4)]],
     metal::uint tid [[thread_position_in_threadgroup]],
     metal::uint group_id [[threadgroup_position_in_grid]],
@@ -69,7 +69,7 @@ kernel void lossBackward(
     metal::uint base = group_id * p.cols;
     for (metal::uint col = tid; col < p.cols; col += p.group_size) {
         float prob = metal::exp(float(x_cache[base+col]) - lse_cache[row]);
-        float g = prob - (col == y[row] ? 1.0f : 0.0f);
-        dZ[base + col] = bfloat(g);
+        float g = prob - (col == y_cache[row] ? 1.0f : 0.0f);
+        dZ[base + col] = bfloat(g / float(p.rows)); //loss is averaged over rows, so the gradient is too
     }
 }

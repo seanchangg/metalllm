@@ -72,11 +72,10 @@ kernel void layernormForward(
 
 
 kernel void layernormBackward(
-    device const bfloat* dZ [[buffer(0)]],
+    device bfloat* dZ [[buffer(0)]],
     device const bfloat* x_norm_cache [[buffer(1)]],
     device const bfloat* gamma [[buffer(2)]],
     device const float* stdev [[buffer(3)]],
-    device bfloat* dA [[buffer(4)]],
     device bfloat* dx_norm [[buffer(5)]],
     device metal::atomic_float* dgamma [[buffer(6)]],
     device metal::atomic_float* dbeta [[buffer(7)]],
@@ -124,6 +123,6 @@ kernel void layernormBackward(
     float repdev = 1.0/stdev[gid];
 
     for (int i = tid; i<p.cols;i += p.group_size) {
-        dA[row_start + i] = bfloat(repdev * (dx_norm[row_start+i] - repsum1 - x_norm_cache[row_start +i] * repsum2));
+        dZ[row_start + i] = bfloat(repdev * (dx_norm[row_start+i] - repsum1 - x_norm_cache[row_start +i] * repsum2));
     }
 }
