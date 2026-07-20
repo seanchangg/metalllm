@@ -2,7 +2,7 @@
 
 A from-scratch GPT-style LLM **training** framework written in C++ and Metal Shading Language — no PyTorch, no MLX, no MPSGraph. Every kernel in the forward pass, backward pass, and optimizer is hand-written, and the entire training step (forward → backward → Adam) runs on the GPU. The host only uploads the batch and reads back the loss each iteration.
 
-It trains a character-level transformer on `drake_lyrics.txt` (included) and reaches **~13 ms/iter on an M4 MacBook Air** at the default config below — faster than an equivalent eager-mode PyTorch model on MPS at every size tested (see [Performance](#performance)).
+It trains a character-level transformer on `drake_lyrics.txt` (included) and reaches **~13 ms/iter on an M4 MacBook Air** at the default config below — faster than an equivalent PyTorch model on MPS (eager *and* `torch.compile`) at every size tested (see [Performance](#performance)).
 
 ## Model architecture
 
@@ -107,23 +107,23 @@ iter 42 | loss 2.13 | 23 ms
 
 ### Performance
 
-Benchmarked on an M4 MacBook Air (16 GB) against an architecturally identical PyTorch model on MPS (PyTorch 2.9.1, eager mode, bf16, `F.scaled_dot_product_attention`, Adam, batch = 1 sequence, per-iter `loss.item()` sync). Times are the mean full training iteration (forward + backward + Adam step) over iters 11–45:
+Benchmarked on an M4 MacBook Air (16 GB) against an architecturally identical PyTorch model on MPS (PyTorch 2.9.1, bf16, `F.scaled_dot_product_attention`, Adam, batch = 1 sequence, per-iter `loss.item()` sync), in both eager mode and with `torch.compile`. Times are the mean full training iteration (forward + backward + Adam step) at steady state (iters 11–45 for metalLLM/eager, iters 41–75 for compiled so all compilation is excluded):
 
-| `BLOCK_SIZE` | `N_EMBED` | metalLLM | PyTorch (MPS) | speedup |
-|---|---|---|---|---|
-| 64  | 256 | 5.7 ms  | 10.2 ms | 1.78× |
-| 64  | 384 | 7.3 ms  | 11.3 ms | 1.55× |
-| 64  | 512 | 6.0 ms  | 14.1 ms | 2.35× |
-| 128 | 256 | 4.3 ms  | 9.4 ms  | 2.21× |
-| 128 | 384 | 7.0 ms  | 10.8 ms | 1.55× |
-| 128 | 512 | 10.0 ms | 14.9 ms | 1.49× |
-| 256 | 256 | 6.0 ms  | 9.2 ms  | 1.54× |
-| 256 | 384 | 13.4 ms | 14.0 ms | 1.04× |
-| 256 | 512 | 14.7 ms | 21.3 ms | 1.45× |
+| `BLOCK_SIZE` | `N_EMBED` | metalLLM | PyTorch eager | PyTorch compiled | vs eager | vs compiled |
+|---|---|---|---|---|---|---|
+| 64  | 256 | 5.7 ms  | 10.2 ms | 6.8 ms  | 1.78× | 1.18× |
+| 64  | 384 | 7.3 ms  | 11.3 ms | 9.4 ms  | 1.55× | 1.30× |
+| 64  | 512 | 6.0 ms  | 14.1 ms | 15.8 ms | 2.35× | 2.64× |
+| 128 | 256 | 4.3 ms  | 9.4 ms  | 6.8 ms  | 2.21× | 1.60× |
+| 128 | 384 | 7.0 ms  | 10.8 ms | 12.7 ms | 1.55× | 1.82× |
+| 128 | 512 | 10.0 ms | 14.9 ms | 20.5 ms | 1.49× | 2.05× |
+| 256 | 256 | 6.0 ms  | 9.2 ms  | 10.3 ms | 1.54× | 1.72× |
+| 256 | 384 | 13.4 ms | 14.0 ms | 20.1 ms | 1.04× | 1.50× |
+| 256 | 512 | 14.7 ms | 21.3 ms | 32.5 ms | 1.45× | 2.21× |
 
-metalLLM is faster in every configuration, by 1.0–2.4×. Caveats: the training loop's timer prints whole milliseconds (~±0.5 ms quantization on the metalLLM numbers); at these sizes both implementations are substantially launch-bound, which is why times don't scale linearly with dimensions; and PyTorch is eager mode — `torch.compile` would close some of the gap. The widest margins are on small/wide configs where PyTorch's per-op dispatch overhead dominates.
+metalLLM is faster in every configuration against both modes — 1.0–2.4× vs eager, 1.2–2.6× vs compiled. `torch.compile` (Inductor's experimental MPS backend) only helps PyTorch on the smallest shapes, where fusing away per-op dispatch overhead matters most; at larger shapes its generated Metal kernels lose to the tuned MPS matmul/SDPA kernels that eager mode calls, and it ends up *slower* than eager. Caveats: the training loop's timer prints whole milliseconds (~±0.5 ms quantization on the metalLLM numbers), and at these sizes all implementations are substantially launch-bound, which is why times don't scale linearly with dimensions. The widest margins are on small/wide configs where PyTorch's per-op dispatch overhead dominates.
 
-Note for non-default dims: `N_EMBED` is compiled into the shaders as well as `main.cpp` (`linear.metal` and `mlp.metal` and `attention.metal` bake it into `matmul2d` descriptors), so changing it requires updating those two constants to match and rebuilding — a mismatch silently leaves gradient tails unwritten and NaNs the loss.
+Note for non-default dims: `N_EMBED` is compiled into the shaders as well as `main.cpp` (`linear.metal` and `mlp.metal` bake it into `matmul2d` descriptors), so changing it requires updating those two constants to match and rebuilding — a mismatch silently leaves gradient tails unwritten and NaNs the loss.
 
 ## Repo layout notes
 
