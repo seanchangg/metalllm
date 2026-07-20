@@ -107,7 +107,7 @@ iter 42 | loss 2.13 | 23 ms
 
 ### Performance
 
-~23 ms/iter on an M4 MacBook Air at the default config (256 tokens, 6 layers, 384 embed, 6 heads × 64, MLP scale 4).
+~23 ms/iter on an M4 MacBook Air at the default config (256 tokens, 6 layers, 384 embed, 6 heads × 64, MLP scale 4). Finally beat PyTorch (by about 6 ms/iter)
 
 ## Repo layout notes
 
