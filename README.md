@@ -123,7 +123,7 @@ Benchmarked on an M4 MacBook Air (16 GB) against an architecturally identical Py
 
 metalLLM is faster in every configuration, by 1.0–2.4×. Caveats: the training loop's timer prints whole milliseconds (~±0.5 ms quantization on the metalLLM numbers); at these sizes both implementations are substantially launch-bound, which is why times don't scale linearly with dimensions; and PyTorch is eager mode — `torch.compile` would close some of the gap. The widest margins are on small/wide configs where PyTorch's per-op dispatch overhead dominates.
 
-Note for non-default dims: `N_EMBED` is compiled into the shaders as well as `main.cpp` (`linear.metal` and `mlp.metal` bake it into `matmul2d` descriptors), so changing it requires updating those two constants to match and rebuilding — a mismatch silently leaves gradient tails unwritten and NaNs the loss.
+Note for non-default dims: `N_EMBED` is compiled into the shaders as well as `main.cpp` (`linear.metal` and `mlp.metal` and `attention.metal` bake it into `matmul2d` descriptors), so changing it requires updating those two constants to match and rebuilding — a mismatch silently leaves gradient tails unwritten and NaNs the loss.
 
 ## Repo layout notes
 
