@@ -5,8 +5,10 @@
 //float->bfloat handoff between attention backward and ln1 backward run on the
 //GPU via the residualAdd/castFloatToBfloat kernels in elementwise.metal, so
 //nothing breaks the pass into pieces. Activations live in per-block buffers
-//between forward and backward; the host only uploads weights + the batch
-//before a pass and reads the loss / gradients after it.
+//between forward and backward. Weights and Adam state are GPU-resident:
+//uploaded once at construction, gradients gathered and weights updated
+//entirely on the GPU by step() (gatherGrad*/MetalStep/scatterWeight), so the
+//host only uploads the batch each iteration and reads back the loss.
 //
 //Depends on Matrix, the kernel param structs, ModelWeights/ModelGrads, and the
 //N_LAYERS/LR constants from main.cpp, so include this AFTER those definitions.
@@ -71,9 +73,11 @@ struct Model {
     MTL::ComputePipelineState* flashAttnFwdPipeline;
     MTL::ComputePipelineState* computeDPipeline;
     MTL::ComputePipelineState* flashAttnBwdPipeline;
-    MTL::ComputePipelineState* attnGradPipeline;
+    MTL::ComputePipelineState* attnGradDxPipeline;
+    MTL::ComputePipelineState* attnGradDwPipeline;
     MTL::ComputePipelineState* projFwdPipeline;
-    MTL::ComputePipelineState* projBwdPipeline;
+    MTL::ComputePipelineState* projBwdDwPipeline;
+    MTL::ComputePipelineState* projBwdDxPipeline;
     MTL::ComputePipelineState* mlpFwdOnePipeline;
     MTL::ComputePipelineState* mlpFwdTwoPipeline;
     MTL::ComputePipelineState* mlpBwdOnePipeline;
@@ -85,6 +89,9 @@ struct Model {
     MTL::ComputePipelineState* residualAddPipeline;
     MTL::ComputePipelineState* castPipeline;
     MTL::ComputePipelineState* stepPipeline;
+    MTL::ComputePipelineState* gatherFloatPipeline;
+    MTL::ComputePipelineState* gatherBfloatPipeline;
+    MTL::ComputePipelineState* scatterPipeline;
 
     //dimensions
     uint32_t blockSize;
@@ -144,14 +151,17 @@ struct Model {
     MTL::Buffer* dAttnDBuffer;  //computeD output
     MTL::Buffer* dMlpVBuffer;
 
-    //optimizer (the old AdamOptimizer + MetalOptimStep merged in)
-    std::vector<std::vector<__bf16>*> optWeights;
-    std::vector<std::vector<__bf16>*> optGrads;
+    //optimizer: weights and Adam state are GPU-resident. The host vectors in
+    //ModelWeights are read once at construction (initial upload + master
+    //build) and never touched again; per-parameter bookkeeping below drives
+    //the gather (grads -> flat) and scatter (master -> weight buffers) passes
+    //that bracket the Adam kernel inside step()'s command buffer.
+    struct FlatCopyParams { uint32_t count; uint32_t offset; };
+    std::vector<std::vector<__bf16>*> optWeights; //host init values, used for sizes + one-time upload
+    std::vector<MTL::Buffer*> optWeightBuffers;   //bf16 buffers the forward kernels read
+    std::vector<MTL::Buffer*> optGradBuffers;     //buffers backward writes each parameter's grad into
+    std::vector<bool> optGradIsFloat;             //float atomic accumulators vs bf16
     std::vector<size_t> optOffsets;
-    std::vector<float> master;
-    std::vector<__bf16> flatGrads;
-    std::vector<__bf16> momentum;
-    std::vector<__bf16> variance;
     size_t optCount = 0;
     float stepCounter = 0.0f;
     MTL::Buffer* parameterBuffer;
@@ -187,9 +197,11 @@ struct Model {
         flashAttnFwdPipeline = makePipeline(library, "flashAttentionForward");
         computeDPipeline = makePipeline(library, "computeD");
         flashAttnBwdPipeline = makePipeline(library, "flashAttentionBackward");
-        attnGradPipeline = makePipeline(library, "computeGrad");
+        attnGradDxPipeline = makePipeline(library, "computeGradDx");
+        attnGradDwPipeline = makePipeline(library, "computeGradDw");
         projFwdPipeline = makePipeline(library, "projForward");
-        projBwdPipeline = makePipeline(library, "projBackward");
+        projBwdDwPipeline = makePipeline(library, "projBackwarddW");
+        projBwdDxPipeline = makePipeline(library, "projBackwarddX");
         mlpFwdOnePipeline = makePipeline(library, "mlpForwardOne");
         mlpFwdTwoPipeline = makePipeline(library, "mlpForwardTwo");
         mlpBwdOnePipeline = makePipeline(library, "mlpBackwardOne");
@@ -201,6 +213,9 @@ struct Model {
         residualAddPipeline = makePipeline(library, "residualAdd");
         castPipeline = makePipeline(library, "castFloatToBfloat");
         stepPipeline = makePipeline(library, "MetalStep");
+        gatherFloatPipeline = makePipeline(library, "gatherGradFloat");
+        gatherBfloatPipeline = makePipeline(library, "gatherGradBfloat");
+        scatterPipeline = makePipeline(library, "scatterWeight");
         library->release();
 
         //embed
@@ -262,24 +277,27 @@ struct Model {
         dAttnDBuffer = newSharedBuffer((size_t)blockSize * numHeads * sizeof(__bf16));
         dMlpVBuffer = newSharedBuffer(hiddenBytes);
 
-        //optimizer: register every weight/grad pair, then flatten
-        addParam(weights.embed_weights, grads.d_embed_weights);
-        addParam(weights.pos_weights, grads.d_pos_weights);
+        //optimizer: register every parameter with its GPU weight/grad buffer,
+        //then build the flat master copy and Adam state once. Registration
+        //order defines the flat layout, nothing else depends on it.
+        addParam(weights.embed_weights, embedWeightBuffer, dEmbedWeightBuffer, true);
+        addParam(weights.pos_weights, posWeightBuffer, dStreamBuffer, false); //dStream holds the pos grad after backward
         for (int n = 0; n < N_LAYERS; ++n) {
-            addParam(weights.blocks[n].ln1_gamma, grads.blocks[n].d_ln1_gamma.matrix);
-            addParam(weights.blocks[n].ln1_beta, grads.blocks[n].d_ln1_beta.matrix);
-            addParam(weights.blocks[n].qw, grads.blocks[n].d_qw);
-            addParam(weights.blocks[n].kw, grads.blocks[n].d_kw);
-            addParam(weights.blocks[n].vw, grads.blocks[n].d_vw);
-            addParam(weights.blocks[n].proj_weights, grads.blocks[n].d_proj_weights);
-            addParam(weights.blocks[n].ln2_gamma, grads.blocks[n].d_ln2_gamma.matrix);
-            addParam(weights.blocks[n].ln2_beta, grads.blocks[n].d_ln2_beta.matrix);
-            addParam(weights.blocks[n].mlp_up, grads.blocks[n].d_mlp_up);
-            addParam(weights.blocks[n].mlp_down, grads.blocks[n].d_mlp_down);
+            BlockBuffers& block = blocks[n];
+            addParam(weights.blocks[n].ln1_gamma, block.ln1.gammaBuffer, block.ln1.dGammaBuffer, true);
+            addParam(weights.blocks[n].ln1_beta, block.ln1.betaBuffer, block.ln1.dBetaBuffer, true);
+            addParam(weights.blocks[n].qw, block.qwBuffer, block.dQwBuffer, true);
+            addParam(weights.blocks[n].kw, block.kwBuffer, block.dKwBuffer, false);
+            addParam(weights.blocks[n].vw, block.vwBuffer, block.dVwBuffer, false);
+            addParam(weights.blocks[n].proj_weights, block.projwBuffer, block.dProjwBuffer, false);
+            addParam(weights.blocks[n].ln2_gamma, block.ln2.gammaBuffer, block.ln2.dGammaBuffer, true);
+            addParam(weights.blocks[n].ln2_beta, block.ln2.betaBuffer, block.ln2.dBetaBuffer, true);
+            addParam(weights.blocks[n].mlp_up, block.upprojBuffer, block.dUpBuffer, false);
+            addParam(weights.blocks[n].mlp_down, block.downprojBuffer, block.dDpBuffer, false);
         }
-        addParam(weights.ln_final_gamma, grads.d_ln_final_gamma.matrix);
-        addParam(weights.ln_final_beta, grads.d_ln_final_beta.matrix);
-        addParam(weights.output_proj, grads.d_output_proj);
+        addParam(weights.ln_final_gamma, lnFinal.gammaBuffer, lnFinal.dGammaBuffer, true);
+        addParam(weights.ln_final_beta, lnFinal.betaBuffer, lnFinal.dBetaBuffer, true);
+        addParam(weights.output_proj, linearWBuffer, dLinearWBuffer, false);
 
         size_t total = 0;
         for (std::vector<__bf16>* weight : optWeights) {
@@ -287,18 +305,24 @@ struct Model {
             total += weight->size();
         }
         optCount = ((total + 16383) / 16384) * 16384;
-        master.assign(optCount, 0.0f);
-        flatGrads.assign(optCount, (__bf16)0.0f);
-        momentum.assign(optCount, (__bf16)0.0f);
-        variance.assign(optCount, (__bf16)0.0f);
-        for (size_t i = 0; i < optWeights.size(); ++i) {
-            std::transform(optWeights[i]->begin(), optWeights[i]->end(), master.begin() + optOffsets[i],
-                           [](__bf16 x) { return (float)x; });
-        }
         parameterBuffer = newSharedBuffer(optCount * sizeof(float));
         gradientBuffer = newSharedBuffer(optCount * sizeof(__bf16));
         momentumBuffer = newSharedBuffer(optCount * sizeof(__bf16));
         varianceBuffer = newSharedBuffer(optCount * sizeof(__bf16));
+
+        //one-time upload: master floats + Adam state + the bf16 weight buffers.
+        //the padded tail of the gradient buffer stays zero forever, so the
+        //step kernel leaves the padded master/momentum/variance tail alone.
+        auto* masterOut = static_cast<float*>(parameterBuffer->contents());
+        std::fill(masterOut, masterOut + optCount, 0.0f);
+        for (size_t i = 0; i < optWeights.size(); ++i) {
+            std::transform(optWeights[i]->begin(), optWeights[i]->end(), masterOut + optOffsets[i],
+                           [](__bf16 x) { return (float)x; });
+            std::memcpy(optWeightBuffers[i]->contents(), optWeights[i]->data(), optWeights[i]->size() * sizeof(__bf16));
+        }
+        std::memset(gradientBuffer->contents(), 0, optCount * sizeof(__bf16));
+        std::memset(momentumBuffer->contents(), 0, optCount * sizeof(__bf16));
+        std::memset(varianceBuffer->contents(), 0, optCount * sizeof(__bf16));
     }
 
     //---------------------------------------------------------------- helpers
@@ -384,45 +408,20 @@ struct Model {
         encoder->dispatchThreadgroups(MTL::Size(layernormParams.rows, 1, 1), MTL::Size(layernormParams.group_size, 1, 1));
         encoder->endEncoding();
     }
-    void uploadLayernormWeights(LayernormBuffers& ln, const std::vector<__bf16>& gamma, const std::vector<__bf16>& beta) {
-        std::memcpy(ln.gammaBuffer->contents(), gamma.data(), (size_t)embedDim * sizeof(__bf16));
-        std::memcpy(ln.betaBuffer->contents(), beta.data(), (size_t)embedDim * sizeof(__bf16));
-    }
-    static void copyOutBf16(MTL::Buffer* buffer, Matrix<__bf16>& out) {
-        auto* gpuOut = static_cast<__bf16*>(buffer->contents());
-        std::copy(gpuOut, gpuOut + out.matrix.size(), out.matrix.begin());
-    }
-    static void copyOutFloat(MTL::Buffer* buffer, Matrix<__bf16>& out) {
-        auto* gpuOut = static_cast<float*>(buffer->contents());
-        std::copy(gpuOut, gpuOut + out.matrix.size(), out.matrix.begin());
-    }
-
     //---------------------------------------------------------------- forward
+    //weights are GPU-resident (uploaded once at construction, updated in
+    //place by step()), so only the batch crosses the bus here
     float forward(const std::vector<uint32_t>& inputTokens, const Matrix<uint32_t>& targets,
-                  const ModelWeights& weights) {
-        //upload the batch + every weight, then encode the whole pass
+                  const ModelWeights&) {
         std::memcpy(inputTokensBuffer->contents(), inputTokens.data(), (size_t)blockSize * sizeof(uint32_t));
         std::memcpy(targetsBuffer->contents(), targets.matrix.data(), (size_t)blockSize * sizeof(uint32_t));
-        std::memcpy(embedWeightBuffer->contents(), weights.embed_weights.matrix.data(), (size_t)vocabSize * embedDim * sizeof(__bf16));
-        std::memcpy(posWeightBuffer->contents(), weights.pos_weights.matrix.data(), activationBytes);
         for (int n = 0; n < N_LAYERS; ++n) {
             BlockBuffers& block = blocks[n];
-            const BlockWeights& blockWeights = weights.blocks[n];
-            uploadLayernormWeights(block.ln1, blockWeights.ln1_gamma, blockWeights.ln1_beta);
-            std::memcpy(block.qwBuffer->contents(), blockWeights.qw.matrix.data(), attnWeightBytes);
-            std::memcpy(block.kwBuffer->contents(), blockWeights.kw.matrix.data(), attnWeightBytes);
-            std::memcpy(block.vwBuffer->contents(), blockWeights.vw.matrix.data(), attnWeightBytes);
-            std::memcpy(block.projwBuffer->contents(), blockWeights.proj_weights.matrix.data(), attnWeightBytes);
-            uploadLayernormWeights(block.ln2, blockWeights.ln2_gamma, blockWeights.ln2_beta);
-            std::memcpy(block.upprojBuffer->contents(), blockWeights.mlp_up.matrix.data(), (size_t)embedDim * hiddenDim * sizeof(__bf16));
-            std::memcpy(block.downprojBuffer->contents(), blockWeights.mlp_down.matrix.data(), (size_t)hiddenDim * embedDim * sizeof(__bf16));
             //the qkv kernel accumulates, so its outputs start zeroed
             std::memset(block.qBuffer->contents(), 0, activationFloatBytes);
             std::memset(block.kBuffer->contents(), 0, activationBytes);
             std::memset(block.vBuffer->contents(), 0, activationBytes);
         }
-        uploadLayernormWeights(lnFinal, weights.ln_final_gamma, weights.ln_final_beta);
-        std::memcpy(linearWBuffer->contents(), weights.output_proj.matrix.data(), (size_t)embedDim * vocabSize * sizeof(__bf16));
 
         MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
 
@@ -536,7 +535,7 @@ struct Model {
     }
 
     //--------------------------------------------------------------- backward
-    void backward(ModelGrads& grads) {
+    void backward(ModelGrads&) {
         //zero every accumulated gradient before the pass
         std::memset(dEmbedWeightBuffer->contents(), 0, (size_t)vocabSize * embedDim * sizeof(float));
         std::memset(dLinearWBuffer->contents(), 0, (size_t)embedDim * vocabSize * sizeof(__bf16));
@@ -611,7 +610,8 @@ struct Model {
                 encoder->setBuffer(dStreamBuffer, 0, 6);
                 encoder->setBuffer(block.dDpBuffer, 0, 7);
                 encoder->setBytes(&mlpParameters, sizeof(mlpParameters), 8);
-                encoder->dispatchThreadgroups(MTL::Size(hiddenDim / tileM, 1, 1), MTL::Size(32 * simdGroups, 1, 1));
+                //covers both tilings inside the kernel: hidden strips for dUp/dDp, M x N tiles for dX
+                encoder->dispatchThreadgroups(MTL::Size(std::max(hiddenDim / tileM, tileRows * tileCols), 1, 1), MTL::Size(32 * simdGroups, 1, 1));
                 encoder->endEncoding();
             }
             encodeLayernormBackward(commandBuffer, block.ln2, dBranchBuffer);
@@ -619,14 +619,21 @@ struct Model {
 
             //attention backward: dBranch is the gradient into residual1
             {
-                MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, projBwdPipeline);
+                MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, projBwdDwPipeline);
                 encoder->setBuffer(block.attnOutBuffer, 0, 0);
+                encoder->setBuffer(dBranchBuffer, 0, 1);
+                encoder->setBuffer(block.dProjwBuffer, 0, 2);
+                encoder->setBytes(&attnParams, sizeof(attnParams), 3);
+                encoder->dispatchThreadgroups(MTL::Size(tileCols, tileCols, 1), MTL::Size(32 * simdGroups, 1, 1));
+                encoder->endEncoding();
+            }
+            {
+                MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, projBwdDxPipeline);
+                encoder->setBuffer(dBranchBuffer, 0, 0);
                 encoder->setBuffer(block.projwBuffer, 0, 1);
-                encoder->setBuffer(dBranchBuffer, 0, 2);
-                encoder->setBuffer(dZAttnBuffer, 0, 3);
-                encoder->setBuffer(block.dProjwBuffer, 0, 4);
-                encoder->setBytes(&attnParams, sizeof(attnParams), 5);
-                encoder->dispatchThreadgroups(MTL::Size(tileRows, 1, 1), MTL::Size(32 * simdGroups, 1, 1));
+                encoder->setBuffer(dZAttnBuffer, 0, 2);
+                encoder->setBytes(&attnParams, sizeof(attnParams), 3);
+                encoder->dispatchThreadgroups(MTL::Size(tileCols, tileRows, 1), MTL::Size(32 * simdGroups, 1, 1));
                 encoder->endEncoding();
             }
             {
@@ -657,23 +664,32 @@ struct Model {
                 encoder->endEncoding();
             }
             {
-                MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, attnGradPipeline);
-                encoder->setBuffer(block.ln1.outBuffer, 0, 0);
+                MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, attnGradDxPipeline);
+                encoder->setBuffer(block.dXAttnBuffer, 0, 0);
                 encoder->setBuffer(block.qwBuffer, 0, 1);
                 encoder->setBuffer(block.kwBuffer, 0, 2);
                 encoder->setBuffer(block.vwBuffer, 0, 3);
                 encoder->setBuffer(block.dQBuffer, 0, 4);
                 encoder->setBuffer(block.dKBuffer, 0, 5);
                 encoder->setBuffer(block.dVBuffer, 0, 6);
-                encoder->setBuffer(block.dQwBuffer, 0, 7);
-                encoder->setBuffer(block.dKwBuffer, 0, 8);
-                encoder->setBuffer(block.dVwBuffer, 0, 9);
-                encoder->setBuffer(block.dXAttnBuffer, 0, 10);
-                encoder->setBytes(&attnParams, sizeof(attnParams), 11);
-                encoder->dispatchThreadgroups(MTL::Size(tileRows, 1, 1), MTL::Size(32 * simdGroups, 1, 1));
+                encoder->setBytes(&attnParams, sizeof(attnParams), 7);
+                encoder->dispatchThreadgroups(MTL::Size(tileCols, tileRows, 1), MTL::Size(32 * simdGroups, 1, 1));
                 encoder->endEncoding();
             }
-            //computeGrad writes dX as float; ln1 backward wants bfloat in dStream
+            {
+                MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, attnGradDwPipeline);
+                encoder->setBuffer(block.ln1.outBuffer, 0, 0);
+                encoder->setBuffer(block.dQBuffer, 0, 1);
+                encoder->setBuffer(block.dKBuffer, 0, 2);
+                encoder->setBuffer(block.dVBuffer, 0, 3);
+                encoder->setBuffer(block.dQwBuffer, 0, 4);
+                encoder->setBuffer(block.dKwBuffer, 0, 5);
+                encoder->setBuffer(block.dVwBuffer, 0, 6);
+                encoder->setBytes(&attnParams, sizeof(attnParams), 7);
+                encoder->dispatchThreadgroups(MTL::Size(tileCols, tileCols, 1), MTL::Size(32 * simdGroups, 1, 1));
+                encoder->endEncoding();
+            }
+            //computeGradDx writes dX as float; ln1 backward wants bfloat in dStream
             encodeCast(commandBuffer, block.dXAttnBuffer, dStreamBuffer);
             encodeLayernormBackward(commandBuffer, block.ln1, dStreamBuffer);
             encodeResidualAdd(commandBuffer, dStreamBuffer, dBranchBuffer, dStreamBuffer); //skip connection
@@ -690,72 +706,60 @@ struct Model {
             encoder->endEncoding();
         }
         commitWait(commandBuffer, "backward");
-
-        //harvest the gradients (float buffers convert to bf16 on the copy)
-        copyOutFloat(dEmbedWeightBuffer, grads.d_embed_weights);
-        copyOutBf16(dStreamBuffer, grads.d_pos_weights);
-        for (int n = 0; n < N_LAYERS; ++n) {
-            BlockBuffers& block = blocks[n];
-            BlockGrads& blockGrads = grads.blocks[n];
-            copyOutFloat(block.ln1.dGammaBuffer, blockGrads.d_ln1_gamma);
-            copyOutFloat(block.ln1.dBetaBuffer, blockGrads.d_ln1_beta);
-            copyOutFloat(block.dQwBuffer, blockGrads.d_qw);
-            copyOutBf16(block.dKwBuffer, blockGrads.d_kw);
-            copyOutBf16(block.dVwBuffer, blockGrads.d_vw);
-            copyOutBf16(block.dProjwBuffer, blockGrads.d_proj_weights);
-            copyOutFloat(block.ln2.dGammaBuffer, blockGrads.d_ln2_gamma);
-            copyOutFloat(block.ln2.dBetaBuffer, blockGrads.d_ln2_beta);
-            copyOutBf16(block.dUpBuffer, blockGrads.d_mlp_up);
-            copyOutBf16(block.dDpBuffer, blockGrads.d_mlp_down);
-        }
-        copyOutFloat(lnFinal.dGammaBuffer, grads.d_ln_final_gamma);
-        copyOutFloat(lnFinal.dBetaBuffer, grads.d_ln_final_beta);
-        copyOutBf16(dLinearWBuffer, grads.d_output_proj);
+        //gradients stay on the GPU; step() gathers them straight from the
+        //per-parameter buffers
     }
 
     //------------------------------------------------------------------- step
-    void addParam(std::vector<__bf16>& weight, std::vector<__bf16>& grad) {
+    void addParam(std::vector<__bf16>& weight, MTL::Buffer* weightBuffer, MTL::Buffer* gradBuffer, bool gradIsFloat) {
         optWeights.push_back(&weight);
-        optGrads.push_back(&grad);
+        optWeightBuffers.push_back(weightBuffer);
+        optGradBuffers.push_back(gradBuffer);
+        optGradIsFloat.push_back(gradIsFloat);
     }
-    void addParam(Matrix<__bf16>& weight, Matrix<__bf16>& grad) {
-        addParam(weight.matrix, grad.matrix);
+    void addParam(Matrix<__bf16>& weight, MTL::Buffer* weightBuffer, MTL::Buffer* gradBuffer, bool gradIsFloat) {
+        addParam(weight.matrix, weightBuffer, gradBuffer, gradIsFloat);
     }
+    //everything stays on the GPU: gather each parameter's gradient into the
+    //flat buffer, run Adam on the flat master params, scatter the updated
+    //master back to the bf16 weight buffers the next forward reads
     void step() {
-        for (size_t i = 0; i < optGrads.size(); ++i) {
-            std::copy(optGrads[i]->begin(), optGrads[i]->end(), flatGrads.begin() + optOffsets[i]);
-        }
         stepCounter += 1.0f;
-
-        std::memcpy(parameterBuffer->contents(), master.data(), optCount * sizeof(float));
-        std::memcpy(gradientBuffer->contents(), flatGrads.data(), optCount * sizeof(__bf16));
-        std::memcpy(momentumBuffer->contents(), momentum.data(), optCount * sizeof(__bf16));
-        std::memcpy(varianceBuffer->contents(), variance.data(), optCount * sizeof(__bf16));
         StepParams stepParams{(uint32_t)optCount};
         stepParams.lr_t = LR * std::sqrt(1.0f - std::pow(stepParams.beta2, stepCounter))
                              / (1.0f - std::pow(stepParams.beta1, stepCounter));
 
         MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, stepPipeline);
-        encoder->setBuffer(parameterBuffer, 0, 0);
-        encoder->setBuffer(gradientBuffer, 0, 1);
-        encoder->setBuffer(momentumBuffer, 0, 2);
-        encoder->setBuffer(varianceBuffer, 0, 3);
-        encoder->setBytes(&stepParams, sizeof(stepParams), 4);
-        encoder->dispatchThreadgroups(MTL::Size(optCount / 16384, 1, 1), MTL::Size(256, 1, 1));
-        encoder->endEncoding();
-        commitWait(commandBuffer, "adam step");
-
-        auto* parameterOut = static_cast<float*>(parameterBuffer->contents());
-        std::copy(parameterOut, parameterOut + optCount, master.begin());
-        auto* momentumOut = static_cast<__bf16*>(momentumBuffer->contents());
-        std::copy(momentumOut, momentumOut + optCount, momentum.begin());
-        auto* varianceOut = static_cast<__bf16*>(varianceBuffer->contents());
-        std::copy(varianceOut, varianceOut + optCount, variance.begin());
         for (size_t i = 0; i < optWeights.size(); ++i) {
-            std::transform(master.begin() + optOffsets[i], master.begin() + optOffsets[i] + optWeights[i]->size(),
-                           optWeights[i]->begin(), [](float x) { return (__bf16)x; });
+            FlatCopyParams copyParams{(uint32_t)optWeights[i]->size(), (uint32_t)optOffsets[i]};
+            MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer,
+                optGradIsFloat[i] ? gatherFloatPipeline : gatherBfloatPipeline);
+            encoder->setBuffer(optGradBuffers[i], 0, 0);
+            encoder->setBuffer(gradientBuffer, 0, 1);
+            encoder->setBytes(&copyParams, sizeof(copyParams), 2);
+            encoder->dispatchThreadgroups(MTL::Size((copyParams.count + 1023) / 1024, 1, 1), MTL::Size(1024, 1, 1));
+            encoder->endEncoding();
         }
+        {
+            MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, stepPipeline);
+            encoder->setBuffer(parameterBuffer, 0, 0);
+            encoder->setBuffer(gradientBuffer, 0, 1);
+            encoder->setBuffer(momentumBuffer, 0, 2);
+            encoder->setBuffer(varianceBuffer, 0, 3);
+            encoder->setBytes(&stepParams, sizeof(stepParams), 4);
+            encoder->dispatchThreadgroups(MTL::Size(optCount / 16384, 1, 1), MTL::Size(256, 1, 1));
+            encoder->endEncoding();
+        }
+        for (size_t i = 0; i < optWeights.size(); ++i) {
+            FlatCopyParams copyParams{(uint32_t)optWeights[i]->size(), (uint32_t)optOffsets[i]};
+            MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, scatterPipeline);
+            encoder->setBuffer(parameterBuffer, 0, 0);
+            encoder->setBuffer(optWeightBuffers[i], 0, 1);
+            encoder->setBytes(&copyParams, sizeof(copyParams), 2);
+            encoder->dispatchThreadgroups(MTL::Size((copyParams.count + 1023) / 1024, 1, 1), MTL::Size(1024, 1, 1));
+            encoder->endEncoding();
+        }
+        commitWait(commandBuffer, "adam step");
     }
 
     ~Model() {
@@ -830,9 +834,11 @@ struct Model {
         flashAttnFwdPipeline->release();
         computeDPipeline->release();
         flashAttnBwdPipeline->release();
-        attnGradPipeline->release();
+        attnGradDxPipeline->release();
+        attnGradDwPipeline->release();
         projFwdPipeline->release();
-        projBwdPipeline->release();
+        projBwdDwPipeline->release();
+        projBwdDxPipeline->release();
         mlpFwdOnePipeline->release();
         mlpFwdTwoPipeline->release();
         mlpBwdOnePipeline->release();
@@ -844,6 +850,9 @@ struct Model {
         residualAddPipeline->release();
         castPipeline->release();
         stepPipeline->release();
+        gatherFloatPipeline->release();
+        gatherBfloatPipeline->release();
+        scatterPipeline->release();
         commandQueue->release();
         pool->release();
         device->release();

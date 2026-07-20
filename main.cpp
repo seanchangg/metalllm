@@ -127,10 +127,13 @@ struct mlpParams {
 static const float LR = 0.003f;
 static const int BLOCK_SIZE = 256;
 static const int N_EMBED = 384;
+//HEAD_SIZE must be 64: attention.metal hardcodes it (HEAD_SIZE constant, the
+//64-wide matmul descriptors, and the dP-buffer reuse in flashAttentionBackward
+//all assume it). other values silently compute wrong attention.
 static const int N_HEADS = 6;
 static const int HEAD_SIZE = 64;
 static const int N_LAYERS = 6;
-static const int MLP_SCALE = 4;
+static const int MLP_SCALE = 2;
 
 template <typename T>
 void print(Matrix<T>& in, int n) {
@@ -957,9 +960,11 @@ struct MetalAttention {
     MTL::ComputePipelineState* dPipeline;
     MTL::ComputePipelineState* flashattnfwdPipeline;
     MTL::ComputePipelineState* flashattnbwdPipeline;
-    MTL::ComputePipelineState* gradPipeline;
+    MTL::ComputePipelineState* graddXPipeline;
+    MTL::ComputePipelineState* graddWPipeline;
     MTL::ComputePipelineState* projfwdPipeline;
-    MTL::ComputePipelineState* projbwdPipeline;
+    MTL::ComputePipelineState* projbwddWPipeline;
+    MTL::ComputePipelineState* projbwddXPipeline;
 
     MTL::Buffer* XBuffer;
     MTL::Buffer* QBuffer;
@@ -1013,11 +1018,14 @@ struct MetalAttention {
         dPipeline = device->newComputePipelineState(library->newFunction(makeNSString("computeD")), &error);
         flashattnfwdPipeline = device->newComputePipelineState(library->newFunction(makeNSString("flashAttentionForward")), &error);
         flashattnbwdPipeline = device->newComputePipelineState(library->newFunction(makeNSString("flashAttentionBackward")), &error);
-        gradPipeline = device->newComputePipelineState(library->newFunction(makeNSString("computeGrad")), &error);
+        graddXPipeline = device->newComputePipelineState(library->newFunction(makeNSString("computeGradDx")), &error);
+        graddWPipeline = device->newComputePipelineState(library->newFunction(makeNSString("computeGradDw")), &error);
         projfwdPipeline = device->newComputePipelineState(library->newFunction(makeNSString("projForward")), &error);
-        projbwdPipeline = device->newComputePipelineState(library->newFunction(makeNSString("projBackward")), &error);
+        projbwddWPipeline = device->newComputePipelineState(library->newFunction(makeNSString("projBackwarddW")), &error);
+        projbwddXPipeline = device->newComputePipelineState(library->newFunction(makeNSString("projBackwarddX")), &error);
 
-        if (!qkvPipeline || !flashattnfwdPipeline || !projfwdPipeline || !projbwdPipeline) {
+        if (!qkvPipeline || !flashattnfwdPipeline || !projfwdPipeline || !projbwddWPipeline || !projbwddXPipeline
+            || !flashattnbwdPipeline || !graddXPipeline || !graddWPipeline || !dPipeline) {
             std::cerr << "pipeline: " << error->localizedDescription()->utf8String() << "\n";
             std::exit(1);
         }
@@ -1118,88 +1126,6 @@ struct MetalAttention {
         auto* gpuOut = static_cast<__bf16*>(projOutBuffer->contents());
         std::copy(gpuOut, gpuOut + out.matrix.size(), out.matrix.begin());
     }
-    /*
-    void computeQKV(const Matrix<__bf16>& x, const Matrix<__bf16>& qw, const Matrix<__bf16>& kw, const Matrix<__bf16>& vw) {
-        std::memcpy(XBuffer->contents(), x.matrix.data(), xBytes);
-        std::memcpy(qwBuffer->contents(), qw.matrix.data(), qkv_weightBytes);
-        std::memcpy(kwBuffer->contents(), kw.matrix.data(), qkv_weightBytes);
-        std::memcpy(vwBuffer->contents(), vw.matrix.data(), qkv_weightBytes);
-        std::memset(QBuffer->contents(), 0, qBytes);
-        std::memset(KBuffer->contents(), 0, kvBytes);
-        std::memset(VBuffer->contents(), 0, kvBytes);
-
-        MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* encoder = commandBuffer->computeCommandEncoder();
-
-        encoder->setComputePipelineState(qkvPipeline);
-        encoder->setBuffer(XBuffer, 0, 0);
-        encoder->setBuffer(QBuffer, 0, 1);
-        encoder->setBuffer(KBuffer, 0, 2);
-        encoder->setBuffer(VBuffer, 0, 3);
-        encoder->setBuffer(qwBuffer, 0, 4);
-        encoder->setBuffer(kwBuffer, 0, 5);
-        encoder->setBuffer(vwBuffer, 0, 6);
-        encoder->setBuffer(paramsBuffer, 0, 7);
-
-        encoder->dispatchThreadgroups(MTL::Size(attn_tiles_y, attn_tiles_x, 1), MTL::Size(32*simd_groups, 1, 1));
-        encoder->endEncoding();
-        commandBuffer->commit();
-        commandBuffer->waitUntilCompleted();
-        if (commandBuffer->status() == MTL::CommandBufferStatusError) {
-            auto* e = commandBuffer->error();
-            std::cerr << "cmdbuf: " << (e ? e->localizedDescription()->utf8String() : "unknown") << "\n";
-        }
-
-    }
-    void flashattnForward() {
-        MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* encoder = commandBuffer->computeCommandEncoder();
-
-        encoder->setComputePipelineState(flashattnfwdPipeline);
-        encoder->setThreadgroupMemoryLength(tile_m * params.D * sizeof(float), 0); //Accumulator
-        encoder->setThreadgroupMemoryLength(tile_n*tile_m*sizeof(__bf16), 1);//softmax_out tile buffer
-        encoder->setThreadgroupMemoryLength(tile_m * sizeof(float), 2);
-        encoder->setThreadgroupMemoryLength(tile_m * sizeof(float), 3);
-        encoder->setBuffer(QBuffer, 0, 0);
-        encoder->setBuffer(KBuffer, 0, 1);
-        encoder->setBuffer(VBuffer, 0, 2);
-        encoder->setBuffer(OutBuffer, 0, 3);
-        encoder->setBuffer(lBuffer, 0, 4);
-        encoder->setBuffer(paramsBuffer, 0, 5);
-
-        encoder->dispatchThreadgroups(MTL::Size(attn_tiles_y * params.NH, 1, 1), MTL::Size(32*simd_groups, 1, 1));
-        encoder->endEncoding();
-        commandBuffer->commit();
-        commandBuffer->waitUntilCompleted();
-        if (commandBuffer->status() == MTL::CommandBufferStatusError) {
-            auto* e = commandBuffer->error();
-            std::cerr << "cmdbuf: " << (e ? e->localizedDescription()->utf8String() : "unknown") << "\n";
-        }
-
-
-    }
-    void projForward(const Matrix<__bf16>& projw, Matrix<__bf16>& out) {
-        std::memcpy(projwBuffer->contents(), projw.matrix.data(), qkv_weightBytes);
-
-        MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* encoder = commandBuffer->computeCommandEncoder();
-
-        encoder->setComputePipelineState(projfwdPipeline);
-        encoder->setBuffer(OutBuffer, 0, 0);
-        encoder->setBuffer(projwBuffer, 0, 1);
-        encoder->setBuffer(projOutBuffer, 0, 2);
-        encoder->setBuffer(paramsBuffer, 0, 3);
-
-        encoder->dispatchThreadgroups(MTL::Size(attn_tiles_y, attn_tiles_x, 1), MTL::Size(32*simd_groups, 1, 1));
-        encoder->endEncoding();
-
-        commandBuffer->commit();
-        commandBuffer->waitUntilCompleted();
-
-        auto* gpuOut = static_cast<__bf16*>(projOutBuffer->contents());
-        std::copy(gpuOut, gpuOut + out.matrix.size(), out.matrix.begin());
-    }
-    */
     void backward (const Matrix<__bf16>& dRes, Matrix<__bf16>& dprojw, Matrix<__bf16>& dX, Matrix<__bf16>& dqw, Matrix<__bf16>& dkw, Matrix<__bf16>& dvw) {
         std::memcpy(dResBuffer->contents(), dRes.matrix.data(), outBytes);
         std::memset(dProjwBuffer->contents(), 0, qkv_weightBytes);
@@ -1213,18 +1139,26 @@ struct MetalAttention {
 
         //proj backward
         MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* projbwdEncoder = commandBuffer->computeCommandEncoder();
+        MTL::ComputeCommandEncoder* projbwddWEncoder = commandBuffer->computeCommandEncoder();
 
-        projbwdEncoder->setComputePipelineState(projbwdPipeline);
-        projbwdEncoder->setBuffer(OutBuffer, 0, 0);
-        projbwdEncoder->setBuffer(projwBuffer, 0, 1);
-        projbwdEncoder->setBuffer(dResBuffer, 0, 2);
-        projbwdEncoder->setBuffer(dZBuffer, 0, 3);
-        projbwdEncoder->setBuffer(dProjwBuffer, 0, 4);
-        projbwdEncoder->setBuffer(paramsBuffer, 0, 5);
+        projbwddWEncoder->setComputePipelineState(projbwddWPipeline);
+        projbwddWEncoder->setBuffer(OutBuffer, 0, 0);
+        projbwddWEncoder->setBuffer(dResBuffer, 0, 1);
+        projbwddWEncoder->setBuffer(dProjwBuffer, 0, 2);
+        projbwddWEncoder->setBuffer(paramsBuffer, 0, 3);
 
-        projbwdEncoder->dispatchThreadgroups(MTL::Size(attn_tiles_y, 1, 1), MTL::Size(32*simd_groups, 1, 1));
-        projbwdEncoder->endEncoding();
+        projbwddWEncoder->dispatchThreadgroups(MTL::Size(attn_tiles_x, attn_tiles_x, 1), MTL::Size(32*simd_groups, 1, 1));
+        projbwddWEncoder->endEncoding();
+
+        MTL::ComputeCommandEncoder* projbwddXEncoder = commandBuffer->computeCommandEncoder();
+
+        projbwddXEncoder->setComputePipelineState(projbwddXPipeline);
+        projbwddXEncoder->setBuffer(dResBuffer, 0, 0);
+        projbwddXEncoder->setBuffer(projwBuffer, 0, 1);
+        projbwddXEncoder->setBuffer(dZBuffer, 0, 2);
+        projbwddXEncoder->setBuffer(paramsBuffer, 0, 3);        
+        projbwddXEncoder->dispatchThreadgroups(MTL::Size(attn_tiles_x, attn_tiles_y, 1), MTL::Size(32*simd_groups, 1, 1));
+        projbwddXEncoder->endEncoding();
         
         //compute D
         MTL::ComputeCommandEncoder* dEncoder = commandBuffer->computeCommandEncoder();
@@ -1261,24 +1195,38 @@ struct MetalAttention {
         flashattnbwdEncoder->endEncoding();
         
         //compute grad
-        MTL::ComputeCommandEncoder* gradEncoder = commandBuffer->computeCommandEncoder();
+        
+        //dX portion
+        MTL::ComputeCommandEncoder* graddXEncoder = commandBuffer->computeCommandEncoder();
 
-        gradEncoder->setComputePipelineState(gradPipeline);
-        gradEncoder->setBuffer(XBuffer, 0, 0);
-        gradEncoder->setBuffer(qwBuffer, 0, 1);
-        gradEncoder->setBuffer(kwBuffer, 0,2);
-        gradEncoder->setBuffer(vwBuffer, 0, 3);
-        gradEncoder->setBuffer(dQBuffer, 0, 4);
-        gradEncoder->setBuffer(dKBuffer, 0, 5);
-        gradEncoder->setBuffer(dVBuffer, 0, 6);
-        gradEncoder->setBuffer(dQwBuffer, 0, 7);
-        gradEncoder->setBuffer(dKwBuffer, 0, 8);
-        gradEncoder->setBuffer(dVwBuffer, 0, 9);
-        gradEncoder->setBuffer(dXBuffer, 0, 10);
-        gradEncoder->setBuffer(paramsBuffer, 0, 11);
+        graddXEncoder->setComputePipelineState(graddXPipeline);
+        graddXEncoder->setBuffer(dXBuffer, 0, 0);
+        graddXEncoder->setBuffer(qwBuffer, 0, 1);
+        graddXEncoder->setBuffer(kwBuffer, 0, 2);
+        graddXEncoder->setBuffer(vwBuffer, 0, 3);
+        graddXEncoder->setBuffer(dQBuffer, 0, 4);
+        graddXEncoder->setBuffer(dKBuffer, 0, 5);
+        graddXEncoder->setBuffer(dVBuffer, 0, 6);
+        graddXEncoder->setBuffer(paramsBuffer, 0, 7);
 
-        gradEncoder->dispatchThreadgroups(MTL::Size(attn_tiles_y, 1, 1), MTL::Size(32*simd_groups, 1, 1));
-        gradEncoder->endEncoding();
+        graddXEncoder->dispatchThreadgroups(MTL::Size(attn_tiles_x, attn_tiles_y, 1), MTL::Size(32*simd_groups, 1, 1));
+        graddXEncoder->endEncoding();
+        
+        //dW portion
+        MTL::ComputeCommandEncoder* graddWEncoder = commandBuffer->computeCommandEncoder();
+
+        graddWEncoder->setComputePipelineState(graddWPipeline);
+        graddWEncoder->setBuffer(XBuffer, 0, 0);
+        graddWEncoder->setBuffer(dQBuffer, 0, 1);
+        graddWEncoder->setBuffer(dKBuffer, 0, 2);
+        graddWEncoder->setBuffer(dVBuffer, 0, 3);
+        graddWEncoder->setBuffer(dQwBuffer, 0, 4);
+        graddWEncoder->setBuffer(dKwBuffer, 0, 5);
+        graddWEncoder->setBuffer(dVwBuffer, 0, 6);
+        graddWEncoder->setBuffer(paramsBuffer, 0, 7);
+
+        graddWEncoder->dispatchThreadgroups(MTL::Size(attn_tiles_x, attn_tiles_x, 1), MTL::Size(32*simd_groups, 1, 1));
+        graddWEncoder->endEncoding();
         
         commandBuffer->commit();
         commandBuffer->waitUntilCompleted();
@@ -1294,115 +1242,6 @@ struct MetalAttention {
         auto* dvwOut = static_cast<__bf16*>(dVwBuffer->contents());
         std::copy(dvwOut, dvwOut + dvw.matrix.size(), dvw.matrix.begin());
     }
-    /*
-    void projBackward(const Matrix<__bf16>& dRes, Matrix<__bf16>& dprojw) {
-        std::memcpy(dResBuffer->contents(), dRes.matrix.data(), outBytes);
-        std::memset(dProjwBuffer->contents(), 0, qkv_weightBytes);
-
-        MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* encoder = commandBuffer->computeCommandEncoder();
-
-        encoder->setComputePipelineState(projbwdPipeline);
-        encoder->setBuffer(OutBuffer, 0, 0);
-        encoder->setBuffer(projwBuffer, 0, 1);
-        encoder->setBuffer(dResBuffer, 0, 2);
-        encoder->setBuffer(dZBuffer, 0, 3);
-        encoder->setBuffer(dProjwBuffer, 0, 4);
-        encoder->setBuffer(paramsBuffer, 0, 5);
-
-        encoder->dispatchThreadgroups(MTL::Size(attn_tiles_y, 1, 1), MTL::Size(32*simd_groups, 1, 1));
-        encoder->endEncoding();
-
-        commandBuffer->commit();
-        commandBuffer->waitUntilCompleted();
-
-        auto* gpuOut = static_cast<__bf16*>(dProjwBuffer->contents());
-        std::copy(gpuOut, gpuOut + dprojw.matrix.size(), dprojw.matrix.begin());
-    }
-    void computeD() {
-        MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* encoder = commandBuffer->computeCommandEncoder();
-
-        encoder->setComputePipelineState(dPipeline);
-        encoder->setBuffer(dZBuffer, 0, 0);
-        encoder->setBuffer(OutBuffer, 0, 1);
-        encoder->setBuffer(dBuffer, 0, 2);
-        encoder->setBuffer(paramsBuffer, 0, 3);
-
-        encoder->dispatchThreadgroups(MTL::Size(attn_tiles_y * params.NH, 1, 1), MTL::Size(32*simd_groups, 1, 1));
-        encoder->endEncoding();
-        commandBuffer->commit();
-        commandBuffer->waitUntilCompleted();
-    }
-    void flashattnBackward() {
-        MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* encoder = commandBuffer->computeCommandEncoder();
-        std::memset(dQBuffer->contents(), 0, qBytes);
-        std::memset(dKBuffer->contents(), 0, kvBytes);
-        std::memset(dVBuffer->contents(), 0, kvBytes);
-        
-        encoder->setComputePipelineState(flashattnbwdPipeline);
-        encoder->setThreadgroupMemoryLength(tile_m * tile_n * sizeof(__bf16), 0); //S
-        encoder->setThreadgroupMemoryLength(tile_m * tile_n * sizeof(__bf16), 1); //dP
-        encoder->setThreadgroupMemoryLength(tile_m * tile_n * sizeof(__bf16), 2); //dS
-        encoder->setBuffer(dZBuffer, 0, 0);
-        encoder->setBuffer(dBuffer, 0, 1);
-        encoder->setBuffer(lBuffer, 0, 2);
-        encoder->setBuffer(QBuffer, 0, 3);
-        encoder->setBuffer(KBuffer, 0, 4);
-        encoder->setBuffer(VBuffer, 0, 5);
-        encoder->setBuffer(dQBuffer, 0, 6);
-        encoder->setBuffer(dKBuffer, 0, 7);
-        encoder->setBuffer(dVBuffer, 0, 8);
-        encoder->setBuffer(paramsBuffer, 0, 9);
-        
-        encoder->dispatchThreadgroups(MTL::Size(attn_tiles_y * params.NH, 1, 1), MTL::Size(32*simd_groups, 1, 1));
-        encoder->endEncoding();
-
-        commandBuffer->commit();
-        commandBuffer->waitUntilCompleted();
-        if (commandBuffer->status() == MTL::CommandBufferStatusError) {
-            auto* e = commandBuffer->error();
-            std::cerr << "flashattn bwd cmdbuf: " << (e ? e->localizedDescription()->utf8String() : "unknown") << "\n";
-        }
-    }
-    void computeGrad(Matrix<__bf16>& dX, Matrix<__bf16>& dqw, Matrix<__bf16>& dkw, Matrix<__bf16>& dvw) {
-        std::memset(dQwBuffer->contents(), 0, qkv_weightBytes);
-        std::memset(dKwBuffer->contents(), 0, qkv_weightBytes);
-        std::memset(dVwBuffer->contents(), 0, qkv_weightBytes);
-        std::memset(dXBuffer->contents(), 0, xBytes);
-        MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* encoder = commandBuffer->computeCommandEncoder();
-
-        encoder->setComputePipelineState(gradPipeline);
-        encoder->setBuffer(XBuffer, 0, 0);
-        encoder->setBuffer(qwBuffer, 0, 1);
-        encoder->setBuffer(kwBuffer, 0,2);
-        encoder->setBuffer(vwBuffer, 0, 3);
-        encoder->setBuffer(dQBuffer, 0, 4);
-        encoder->setBuffer(dKBuffer, 0, 5);
-        encoder->setBuffer(dVBuffer, 0, 6);
-        encoder->setBuffer(dQwBuffer, 0, 7);
-        encoder->setBuffer(dKwBuffer, 0, 8);
-        encoder->setBuffer(dVwBuffer, 0, 9);
-        encoder->setBuffer(dXBuffer, 0, 10);
-        encoder->setBuffer(paramsBuffer, 0, 11);
-
-        encoder->dispatchThreadgroups(MTL::Size(attn_tiles_y, 1, 1), MTL::Size(32*simd_groups, 1, 1));
-        encoder->endEncoding();
-
-        commandBuffer->commit();
-        commandBuffer->waitUntilCompleted();
-
-        auto* dXOut = static_cast<__bf16*>(dXBuffer->contents());
-        std::copy(dXOut, dXOut + dX.matrix.size(), dX.matrix.begin());
-        auto* dqwOut = static_cast<__bf16*>(dQwBuffer->contents());
-        std::copy(dqwOut, dqwOut + dqw.matrix.size(), dqw.matrix.begin());
-        auto* dkwOut = static_cast<__bf16*>(dKwBuffer->contents());
-        std::copy(dkwOut, dkwOut + dkw.matrix.size(), dkw.matrix.begin());
-        auto* dvwOut = static_cast<__bf16*>(dVwBuffer->contents());
-        std::copy(dvwOut, dvwOut + dvw.matrix.size(), dvw.matrix.begin());
-    } */
     ~MetalAttention() {
         paramsBuffer->release();
         XBuffer->release();
@@ -1431,9 +1270,11 @@ struct MetalAttention {
         dPipeline->release();
         flashattnfwdPipeline->release();
         flashattnbwdPipeline->release();
-        gradPipeline->release();
+        graddXPipeline->release();
+        graddWPipeline->release();
         projfwdPipeline->release();
-        projbwdPipeline->release();
+        projbwddWPipeline->release();
+        projbwddXPipeline->release();
         commandQueue->release();
         pool->release();
         device->release();
@@ -1580,7 +1421,7 @@ struct MetalMLP {
         upEncoder->setBuffer(dDpBuffer, 0, 7);
         upEncoder->setBuffer(paramsBuffer, 0, 8);
 
-        upEncoder->dispatchThreadgroups(MTL::Size(p.N*p.S/tile_m, 1, 1), MTL::Size(32*simd_groups, 1, 1));
+        upEncoder->dispatchThreadgroups(MTL::Size(std::max(p.N*p.S/tile_m, (p.M/tile_m)*(p.N/tile_n)), 1, 1), MTL::Size(32*simd_groups, 1, 1));
         upEncoder->endEncoding();
 
         commandBuffer->commit();

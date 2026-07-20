@@ -111,15 +111,12 @@ kernel void flashAttentionForward (
     for (int k_tile = 0; k_tile<=tile; ++k_tile) { //only loop for lower triangle
         auto mK = Kt.slice(head_offset, k_tile * TILE_N);
         op.run(mQ, mK, St); //automatically coordinates between simdgroups and individual threads
-        threadgroup_barrier(mem_flags::mem_threadgroup); //matmul outputs must land before the elementwise pass
-        for (int i = tid; i<(TILE_M*TILE_N); i+=tptg) { //scale and mask upper triangle if on diagonal
+        threadgroup_barrier(mem_flags::mem_threadgroup); 
+        for (int i = tid; i<(TILE_M*TILE_N); i+=tptg) { 
             float val = S[i] * d_sqrt;
-            int sign = 0;
-            if (k_tile == tile) {
-                int row = i >> 6; //log2(TILE_N)
-                int col = i & (TILE_N - 1);
-                sign = (row-col) >> 31; //-1 if col > row
-            }
+            int grow = int(global_row_start) + (i >> 6);          //global query index
+            int gcol = int(k_tile * TILE_N) + (i & (TILE_N - 1)); //global key index
+            int sign = (grow - gcol) >> 31; //-1 if the key is in the future
             S[i] = bfloat(val + as_type<float>(sign & as_type<int>(-INFINITY)));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -301,75 +298,88 @@ kernel void flashAttentionBackward(
     }
 }
 
-kernel void computeGrad(
-    device bfloat* x [[buffer(0)]],
+kernel void computeGradDx(
+    device float* dX [[buffer(0)]],
     device bfloat* qw [[buffer(1)]],
     device bfloat* kw [[buffer(2)]],
     device bfloat* vw [[buffer(3)]],
     device float* dQ [[buffer(4)]],
     device bfloat* dK [[buffer(5)]],
     device bfloat* dV [[buffer(6)]],
-    device float* dQw [[buffer(7)]], //float dest: matmul2d only allows mixing bfloat operands with the float dQ if the destination is float
-    device bfloat* dKw [[buffer(8)]],
-    device bfloat* dVw [[buffer(9)]],
-    device float* dX [[buffer(10)]], //float dest for the same reason, and it accumulates Q/K/V contributions without bf16 round-trips
-    constant AttentionParams& p [[buffer(11)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint gid [[threadgroup_position_in_grid]], //the row of attention tiles this threadgroup is responsible for
-    uint tptg [[threads_per_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint sgid [[simdgroup_index_in_threadgroup]],
-    uint nsg [[simdgroups_per_threadgroup]]
+    constant AttentionParams& p [[buffer(7)]],
+    uint2 gid [[threadgroup_position_in_grid]] //the row of attention tiles this threadgroup is responsible for
 ) {
-    const uint global_row_start = gid * TILE_M;
-    uint z_tiles = p.N / TILE_M;
-
-    constexpr auto desc_dw = matmul2d_descriptor(
-        N_EMBED, // m: output tile rows
-        TILE_M,
-        static_cast<int>(dynamic_extent), // k: read full K from the tensors. So dynamic extent automatically reduces over K internally. No need to write the logic myself
-        true, false, false, matmul2d_descriptor::mode::multiply_accumulate); //input^T @ dZ
-
+    const uint global_row_start = gid.y * TILE_M;
+    const uint global_col_start = gid.x * TILE_N;
     constexpr auto desc_dx = matmul2d_descriptor(
-        64,                               // m: output tile rows
-        N_EMBED,
+        TILE_M,                               // m: output tile rows
+        TILE_N,
         static_cast<int>(dynamic_extent), // k: read full K from the tensors. So dynamic extent automatically reduces over K internally. No need to write the logic myself
-        false, true, false, matmul2d_descriptor::mode::multiply_accumulate); //dZ @ W^T
+        false, true, false, matmul2d_descriptor::mode::multiply_accumulate); //dZ @ Wt
+    
+    matmul2d<desc_dx, execution_simdgroups<4>> dX_op;
         
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Xt (x, dextents<int32_t, 2>{p.N, p.M});
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> qwt (qw, dextents<int32_t, 2>{p.D*p.NH, p.N});
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> kwt (kw, dextents<int32_t, 2>{p.D*p.NH, p.N});
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> vwt (vw, dextents<int32_t, 2>{p.D*p.NH, p.N});
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> dQt (dQ, dextents<int32_t, 2>{p.D*p.NH, p.M});
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dKt (dK, dextents<int32_t, 2>{p.D*p.NH, p.M});
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dVt(dV, dextents<int32_t, 2>{p.D*p.NH, p.M});
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> dXt (dX, dextents<int32_t, 2>{p.N, p.M});
+    
+    auto mdQ = dQt.slice(0, global_row_start);
+    auto mdK = dKt.slice(0, global_row_start);
+    auto mdV = dVt.slice(0, global_row_start);
+    auto mdX = dXt.slice(global_col_start, global_row_start);
+    auto mQw = qwt.slice(0, global_col_start);
+    auto mKw = kwt.slice(0, global_col_start);
+    auto mVw = vwt.slice(0, global_col_start);
+    
+    dX_op.run(mdQ, mQw, mdX);
+    dX_op.run(mdK, mKw, mdX);
+    dX_op.run(mdV, mVw, mdX);
+}
+
+kernel void computeGradDw(
+    device bfloat* x [[buffer(0)]],
+    device float* dQ [[buffer(1)]],
+    device bfloat* dK [[buffer(2)]],
+    device bfloat* dV [[buffer(3)]],
+    device float* dQw [[buffer(4)]], //float dest: matmul2d only allows mixing bfloat operands with the float dQ if the destination is float
+    device bfloat* dKw [[buffer(5)]],
+    device bfloat* dVw [[buffer(6)]],
+    constant AttentionParams& p [[buffer(7)]],
+    uint2 gid [[threadgroup_position_in_grid]] //the row of attention tiles this threadgroup is responsible for
+) {
+    const uint global_row_start = gid.y * TILE_M;
+    const uint global_col_start = gid.x * TILE_N;
+
+    constexpr auto desc_dw = matmul2d_descriptor(
+        TILE_N, // m: output tile rows
+        TILE_M,
+        static_cast<int>(dynamic_extent), // k: read full K from the tensors. So dynamic extent automatically reduces over K internally. No need to write the logic myself
+        true, false, false, matmul2d_descriptor::mode::multiply_accumulate); //input^T @ dZ
+    
+    matmul2d<desc_dw, execution_simdgroups<4>> dW_op;
+        
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Xt (x, dextents<int32_t, 2>{p.N, p.M});
     tensor<device float, dextents<int32_t, 2>, tensor_inline> dqwt (dQw, dextents<int32_t, 2>{p.D*p.NH, p.N});
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dkwt (dKw, dextents<int32_t, 2>{p.D*p.NH, p.N});
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dvwt (dVw, dextents<int32_t, 2>{p.D*p.NH, p.N});
     tensor<device float, dextents<int32_t, 2>, tensor_inline> dQt (dQ, dextents<int32_t, 2>{p.D*p.NH, p.M});
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dKt (dK, dextents<int32_t, 2>{p.D*p.NH, p.M});
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dVt(dV, dextents<int32_t, 2>{p.D*p.NH, p.M});
-    tensor<device float, dextents<int32_t, 2>, tensor_inline> dXt (dX, dextents<int32_t, 2>{p.N, p.M});
     
-    auto mX = Xt.slice(0, global_row_start);
-    auto mdQ = dQt.slice(0, global_row_start);
-    auto mdK = dKt.slice(0, global_row_start);
-    auto mdV = dVt.slice(0, global_row_start);
-    auto mdX = dXt.slice(0, global_row_start);
-    matmul2d<desc_dw, execution_simdgroups<4>> dW_op;
-    matmul2d<desc_dx, execution_simdgroups<4>> dX_op;
-    
-    dX_op.run(mdQ, qwt, mdX);
-    dX_op.run(mdK, kwt, mdX);
-    dX_op.run(mdV, vwt, mdX);
-    for (int z_tile = 0; z_tile<z_tiles; ++z_tile) {
-        auto mdqw = dqwt.slice(z_tile*TILE_M, 0);
-        auto mdkw = dkwt.slice(z_tile*TILE_M,0);
-        auto mdvw = dvwt.slice(z_tile*TILE_M, 0);
-        auto mdQ = dQt.slice(z_tile*TILE_M, global_row_start);
-        auto mdK = dKt.slice(z_tile*TILE_M, global_row_start);
-        auto mdV = dVt.slice(z_tile*TILE_M, global_row_start);
-        dW_op.run(mX, mdQ, mdqw);
-        dW_op.run(mX, mdK, mdkw);
-        dW_op.run(mX, mdV, mdvw);
-    }
+    auto mX = Xt.slice(global_row_start, 0);
+    auto mdqw = dqwt.slice(global_col_start, global_row_start);
+    auto mdkw = dkwt.slice(global_col_start, global_row_start);
+    auto mdvw = dvwt.slice(global_col_start, global_row_start);
+    auto mdQ = dQt.slice(global_col_start, 0);
+    auto mdK = dKt.slice(global_col_start, 0);
+    auto mdV = dVt.slice(global_col_start, 0);
+    dW_op.run(mX, mdQ, mdqw);
+    dW_op.run(mX, mdK, mdkw);
+    dW_op.run(mX, mdV, mdvw);
 }
     
 kernel void projForward (
@@ -394,41 +404,54 @@ kernel void projForward (
     op.run(mA, mW, mO);
 }
 
-kernel void projBackward (
+kernel void projBackwarddW (
     device bfloat* attn_out [[buffer(0)]],
-    device bfloat* proj_w [[buffer(1)]],
-    device bfloat* dZ [[buffer(2)]],
-    device bfloat* dAttn [[buffer(3)]],
-    device bfloat* dProjw [[buffer(4)]],
-    constant AttentionParams& p [[buffer(5)]],
-    uint gid [[threadgroup_position_in_grid]]
+    device bfloat* dZ [[buffer(1)]],
+    device bfloat* dProjw [[buffer(2)]],
+    constant AttentionParams& p [[buffer(3)]],
+    uint2 gid [[threadgroup_position_in_grid]]
 ) {
-    uint global_row_start = gid * TILE_M;
-    uint z_tiles = p.N / TILE_M;
+    uint global_row_start = gid.y * TILE_M;
+    uint global_col_start = gid.x * TILE_N;
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Ot(attn_out, dextents<int32_t, 2>(p.N, p.M));
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Wt(proj_w, dextents<int32_t, 2>(p.N, p.N));
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dZt(dZ, dextents<int32_t, 2>(p.N, p.M));
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dAttnt(dAttn, dextents<int32_t, 2>(p.N, p.M));
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dProjwt(dProjw, dextents<int32_t, 2>(p.N, p.N));
     constexpr auto desc_dw = matmul2d_descriptor(
-        N_EMBED,
+        TILE_N,
         TILE_M,
         static_cast<int>(dynamic_extent),
         true, false, false, matmul2d_descriptor::mode::multiply_accumulate); //O^T @ dZ
+    
+    matmul2d<desc_dw, execution_simdgroups<4>> dW_op;
+    auto mO = Ot.slice(global_row_start, 0);    
+    auto mdZ = dZt.slice(global_col_start, 0);
+    auto mdProjw = dProjwt.slice(global_col_start, global_row_start);
+    dW_op.run(mO, mdZ, mdProjw);
+}
+
+kernel void projBackwarddX (
+    device bfloat* dZ [[buffer(0)]],
+    device bfloat* proj_w [[buffer(1)]],
+    device bfloat* dAttn [[buffer(2)]],
+    constant AttentionParams& p [[buffer(3)]],
+    uint2 gid [[threadgroup_position_in_grid]]
+ ) {
+    uint global_row_start = gid.y * TILE_M;
+    uint global_col_start = gid.x * TILE_N;
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Wt(proj_w, dextents<int32_t, 2>(p.N, p.N));
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dAttnt(dAttn, dextents<int32_t, 2>(p.N, p.M));
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dZt(dZ, dextents<int32_t, 2>(p.N, p.M));
     constexpr auto desc_dx = matmul2d_descriptor(
         TILE_M,
-        N_EMBED,
+        TILE_N,
         static_cast<int>(dynamic_extent),
         false, true, false); //dZ @ W^T
-    matmul2d<desc_dw, execution_simdgroups<4>> dW_op;
+        
     matmul2d<desc_dx, execution_simdgroups<4>> dX_op;
-    auto mO = Ot.slice(0, global_row_start);
+    auto mdAttn = dAttnt.slice(global_col_start, global_row_start);
+    auto mW = Wt.slice(0, global_col_start);
     auto mdZ = dZt.slice(0, global_row_start);
-    auto mdAttn = dAttnt.slice(0, global_row_start);
-    dX_op.run(mdZ, Wt, mdAttn);
-    for (int z_tile = 0; z_tile<z_tiles; ++z_tile) {
-            auto mdZ = dZt.slice(z_tile*TILE_M, global_row_start);
-            auto mdProjw = dProjwt.slice(z_tile*TILE_M, 0);
-            dW_op.run(mO, mdZ, mdProjw);
-    }
+    dX_op.run(mdZ, mW, mdAttn);
 }
+
+

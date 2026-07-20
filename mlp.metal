@@ -139,6 +139,12 @@ kernel void mlpBackwardTwo (
     constant mlpParams& p [[buffer(8)]],
     uint gid [[threadgroup_position_in_grid]]
 ) {
+    //two independent tilings share this 1-D grid: dUp/dDp strips are indexed
+    //by hidden column tile (N*S/64 of them), the dX output by M x N tile
+    //((M/64)*(N/64) of them). The counts only coincide when S*N == M*N/64*64,
+    //so each half is guarded by its own bound and the host dispatches the max.
+    uint hidden_tiles = p.N * p.S / TILE_M;
+    uint dx_tiles = (p.M / TILE_M) * (p.N / TILE_N);
     uint tile_row = gid % (p.M / TILE_M);
     uint tile_col = gid / (p.M / TILE_M);
     uint global_row_start = TILE_M * tile_row;
@@ -174,17 +180,20 @@ kernel void mlpBackwardTwo (
     matmul2d<desc_dx, execution_simdgroups<4>> dX_op;
     matmul2d<desc_dup, execution_simdgroups<4>> dUp_op;
     matmul2d<desc_ddp, execution_simdgroups<4>> dDp_op;
-    
-    auto mdX = dXt.slice(global_col_start, global_row_start);
-    auto mdV = dVt.slice(hidden_col_start, 0);
-    auto mdUp = dUppt.slice(hidden_col_start, 0);
-    dUp_op.run(Xt, mdV, mdUp);
-    
-    mdV = dVt.slice(0, global_row_start);
-    auto mUp = Upt.slice(0, global_col_start);
-    dX_op.run(mdV, mUp, mdX);
 
-    auto mV = Vt.slice(hidden_col_start, 0);
-    auto mdDp = dDpt.slice(0, hidden_col_start);
-    dDp_op.run(mV, dZt, mdDp);
+    if (gid < hidden_tiles) {
+        auto mdV = dVt.slice(hidden_col_start, 0);
+        auto mdUp = dUppt.slice(hidden_col_start, 0);
+        dUp_op.run(Xt, mdV, mdUp);
+
+        auto mV = Vt.slice(hidden_col_start, 0);
+        auto mdDp = dDpt.slice(0, hidden_col_start);
+        dDp_op.run(mV, dZt, mdDp);
+    }
+    if (gid < dx_tiles) {
+        auto mdX = dXt.slice(global_col_start, global_row_start);
+        auto mdV = dVt.slice(0, global_row_start);
+        auto mUp = Upt.slice(0, global_col_start);
+        dX_op.run(mdV, mUp, mdX);
+    }
 }
